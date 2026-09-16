@@ -1,291 +1,266 @@
 # bujz1-the-bot
 
-Turning an Espressif ESP-VoCat into an expressive voice agent with a self-hosted
-backend and a bridge to Claude Code.
+Turning an Espressif ESP-VoCat into Bujji (BU-JZ1) from Kalki 2898 AD: an
+expressive voice companion with a backend I control.
 
-Last updated: 2026-09-10
+Last updated: 2026-09-15
 
 ## Goals
 
-1. Connect the device to a voice agent I control, either hosted or local.
-2. Let me issue spoken commands that Claude Code acts on, remotely.
-3. Drive the eyes and expressions properly. Today the face stays asleep even
-   while the device is talking.
+1. Connect the device to a voice agent I control, hosted or local.
+2. Issue spoken commands that Claude Code acts on, remotely.
+3. Drive the eyes and expressions properly, in Bujji's red visor style.
 
 These look like three projects but they are one. All three are downstream of a
 single decision: own the backend.
 
 ## Hardware
 
-ESP-VoCat v1.2. Verified against the device, not just the datasheet.
+ESP-VoCat v1.2, verified against the device rather than the datasheet.
 
 | | |
 |---|---|
 | Module | ESP32-S3-WROOM-1-N16R16VA |
-| Flash | 16 MB (GigaDevice, `c8`/`6018`), quad I/O, 1.8 V |
-| PSRAM | 16 MB |
+| Flash | 16 MB (GigaDevice `c8`/`6018`), quad I/O, 1.8 V |
+| PSRAM | 16 MB, **Octal mode, 80 MHz, XIP from PSRAM** |
 | Display | 1.85" round QSPI LCD, 360x360, ST77916 |
-| Audio in | Dual mic array, ES7210 4-ch ADC |
-| Audio out | ES8311 codec, NS4150B 3 W class-D |
-| Motion | BMI270 6-axis IMU |
-| Touch | 2 native touch pads (GPIO6, GPIO7) |
-| Power | BQ27220 fuel gauge, TP4057 charger |
-| Storage | microSD slot, FAT32 only (see below) |
-| USB | Native USB (`0x303A`), enumerates as `USB JTAG_serial debug unit` |
+| Audio | ES7210 4-ch ADC in, ES8311 + NS4150B out |
+| Motion | BMI270 IMU · Touch: 2 pads (GPIO6/7) |
+| USB | Native (`0x303A`), `USB JTAG_serial debug unit` |
+| MAC | b4:3a:45:16:2d:38 |
 
-Stock firmware is [esp-brookesia](https://github.com/espressif/esp-brookesia)
-`release/v0.6`, the `speaker` product, talking to a Coze agent.
+## Use release/v0.7, not v0.6
 
-## Findings from the factory image
+The single most costly mistake of the first session. The factory firmware's own
+app descriptor, read out of the flash dump:
 
-A full 16 MB dump was taken before any modification. Three things came out of it
-that shape the whole build.
+```
+version      : 0.12.6-fac
+project_name : brookesia_speaker
+compile date : Feb  5 2026
+idf_ver      : v5.5.2-dirty
+```
 
-### 1. The factory partition layout differs from the repo, destructively
+Official compatibility:
 
-The device's table is not the one in `products/speaker/partitions.csv`:
-
-| | device | repo default |
+| esp-brookesia | ESP-IDF | status |
 |---|---|---|
-| `nvs_key` | 0xf000, 4K | absent |
-| `fctry` | **0x10000, 24K** | absent |
-| `nvs` | 0x16000, 24K | 0x9000, 16K |
-| `model` | 0x1f000, 600K | **0x10000, 600K** |
-| `board_test` | 0x890000, 1600K | absent |
-| `anim_emotion` | **absent** | 1900K |
+| master (v0.8) | 6.0–6.2 | active development |
+| **release/v0.7** | **>= 5.5, <= 6.0** | **stable — use this** |
+| release/v0.6 | >= 5.3, <= 5.5 | end of maintenance |
 
-The repo's auto-assigned offsets place `model` at 0x10000, exactly where `fctry`
-lives. Building the example unmodified and flashing it writes a SPIFFS image over
-the factory partition.
+v0.6 is EOL and structured completely differently (`products/speaker`, SPIFFS,
+Coze-only). v0.7 restructured into `examples/` + `hal/` + `agent/`, with a real
+HAL board definition for this board. The app we want is
+`examples/agent/chatbot`.
 
-`fctry` holds per-device RainMaker credentials, a certificate and private key
-burned in at manufacture. They are unique to this unit and cannot be reissued.
-Overwriting them permanently removes the device's ability to rejoin RainMaker.
+**Building v0.6 produced a 10-second crash loop**: `assert failed:
+heap_caps_free ... target pointer is outside heap areas`, panic, reboot, repeat.
+It surfaced in unrelated threads (main task teardown, Wi-Fi scan), which is the
+signature of an environment problem rather than a code bug. Root cause was
+almost certainly the missing board configuration — v0.6 has no board manager, so
+the build ran generic PSRAM settings on a board that needs Octal mode with XIP.
 
-**Rule: never `erase-flash`, never flash a partition table that does not preserve
-`fctry` at 0x10000.**
+## Build procedure
 
-### 2. The device has no emotion animation storage
+ESP-IDF on `release/v5.5` **branch** (not the `v5.5` tag — the tag is frozen at
+July 2025 and lacks fourteen months of fixes).
 
-The factory image has no `anim_emotion` partition. The repo allocates 1900K to
-one. This is the most likely explanation for the permanently sleeping face.
-
-### 3. Agent config is loaded from SD at runtime, not compiled in
-
-```c
-// products/speaker/main/modules/coze_agent_config.c
-#define BASE_PATH         BSP_SD_MOUNT_POINT      // "/sdcard"
-#define PRIVATE_KEY_PATH  BASE_PATH "/private_key.pem"
-#define BOT_SETTING_PATH  BASE_PATH "/bot_setting.json"
-```
-
-`EXAMPLE_COZE_AGENT_ENABLE_DEFAULT_CONFIG` defaults to `n`, so menuconfig is the
-fallback and the SD card is the primary configuration path.
-
-Developer Mode (Settings > Developer Mode) sets a magic key in RTC memory,
-reboots, and brings the device up as a USB mass-storage drive. Config files are
-editable in Finder, then "Exit and reboot". No reflash.
-
-**This pattern should be extended rather than replaced.** Our own backend config
-(server URL, auth token, persona, emotion map) belongs in the same file, so
-day-to-day tuning is a text edit instead of a build cycle.
-
-## Target architecture
-
-```
-ESP-VoCat ──WebSocket (Opus audio)──> our server
-                                        │
-                                        ├─ STT      (local Whisper, or Deepgram)
-                                        │
-                                        ├─ router ──┬─ chat ──────> LLM
-                                        │           └─ "computer…" > Claude Agent SDK
-                                        │                            (headless Claude Code,
-                                        │                             scoped to a repo)
-                                        ├─ TTS      (local Piper, or ElevenLabs/Cartesia)
-                                        │
-                                        └─ emotion tag ─────────────> eye animation
-```
-
-One server, one WebSocket, all three goals. The device becomes an audio and
-display endpoint; every decision worth controlling lives on hardware we own.
-
-## Design decisions
-
-### Keep esp-brookesia, replace the agent layer
-
-Fork `products/speaker` and swap the Coze client for a WebSocket client to our
-server. Everything difficult is retained: mic array and sound-source
-localization, ES8311/ES7210 audio path, Opus encoding, local wake word, the round
-display stack, the animation system.
-
-**Rejected: flashing xiaozhi-esp32.** Its self-hosted server story is more mature
-and its server URL is runtime-configurable, but it has no board definition for
-VoCat's ST77916 round QSPI panel and dual-codec audio. That trades a contained
-backend swap for an open-ended display and audio port on a board that already has
-an official, working BSP.
-
-### Goal 1: our own voice agent
-
-The transport is compiled in, so pointing at our own server is a one-time code
-change plus reflash. After that, the server URL and credentials move into the
-SD config file and never require a rebuild again.
-
-### Goal 2: the Claude bridge
-
-Mechanism is the Claude Agent SDK, running Claude Code headlessly. The server
-takes the transcript, opens a session scoped to a working directory, and speaks
-the result back.
-
-Design this in from the start, not later. Voice transcription is lossy, and an
-agent with shell and filesystem access acting on a misheard sentence is a real
-failure mode:
-
-- Scope sessions to specific directories, never the home directory.
-- Allowlist the tools that may run without confirmation.
-- Require spoken confirmation for anything destructive.
-- Log every command and its transcript so mistakes are traceable.
-
-### Goal 3: expressions
-
-No custom animation work needed. `core/brookesia_core/ai_framework/expression`
-already provides:
-
-```cpp
-bool setEmoji(const std::string &emoji);
-bool insertEmojiTemporary(const std::string &emoji, uint32_t duration_ms = 1000);
-bool setEmotion(EmotionType type, gui::AnimPlayer::Operation operation, bool immediate);
-bool setSystemIcon(const std::string &icon);
-```
-
-with an `EmojiMap` of `string -> (EmotionType, IconType)`.
-
-The integration is: server tags each reply with an emotion string, firmware calls
-`setEmoji("happy")`. `insertEmojiTemporary` covers momentary reactions such as a
-blink or a nod without disturbing the base state.
-
-Goal 3 therefore needs three things, none of them novel: the `anim_emotion`
-partition, the assets, and a backend that emits an emotion field.
-
-## Build environment
-
-macOS on Apple Silicon.
-
-ESP-IDF v5.5 cannot build its virtualenv under Python 3.14. Python 3.11 is
-required. `idfenv.sh`:
+Python 3.14 cannot create IDF's virtualenv. Use 3.11. `idfenv.sh`:
 
 ```bash
 export PATH="/opt/homebrew/opt/python@3.11/libexec/bin:$PATH"
 source ~/esp/esp-idf/export.sh >/dev/null 2>&1
 ```
 
-IDF's installer did not pull `cmake` or `ninja`. Without them `idf.py` exits 0
-while doing nothing, which is a confusing failure:
+IDF's installer does not pull `cmake`/`ninja`. Without them `idf.py` **exits 0
+while doing nothing**, which is a confusing failure:
 
 ```bash
 python "$IDF_PATH/tools/idf_tools.py" install cmake ninja
 ```
 
-Build:
+Then, and this step is mandatory:
 
 ```bash
-source idfenv.sh
-cd esp-brookesia/products/speaker
-D="sdkconfig.defaults;sdkconfig.ci.board.esp_vocat_1_2;sdkconfig.vocat"
-idf.py -DSDKCONFIG_DEFAULTS="$D" set-target esp32s3
-idf.py -DSDKCONFIG_DEFAULTS="$D" build
+cd examples/agent/chatbot
+idf.py gen-bmgr-config -b esp_vocat_board_v1_2   # wires in the HAL board
+idf.py build
+idf.py -p <PORT> flash
 ```
 
-`sdkconfig.vocat` selects the custom partition table:
+`gen-bmgr-config` pulls in the board's own defaults, including the PSRAM
+settings that matter:
 
 ```
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_vocat.csv"
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_SPIRAM_SPEED_80M=y
 ```
 
-## Custom partition table
+Note `idf_ext.py` **fails the build if user sdkconfig defaults load after
+`board_manager.defaults`**, so you cannot append an override file. To change a
+setting, edit what the board defaults already reference.
 
-Reproduces the factory layout byte-for-byte and appends `anim_emotion` in the
-free space after `anim_boot`. Verified: the first 11 entries are byte-identical
-to the factory table.
+## The partition table will destroy your credentials
+
+`fctry` at 0x10000 holds per-device RainMaker credentials burned in at
+manufacture. They are unique and cannot be reissued. **Both** v0.6's and v0.7's
+stock partition tables place a 600K `model` partition at exactly 0x10000.
+
+Flashing either one unmodified overwrites them permanently.
+
+`examples/agent/chatbot/partitions_16m.csv` is therefore replaced with a table
+whose first five entries are byte-identical to the factory layout (verified
+programmatically against the flash dump), keeping v0.7's LittleFS/FAT types for
+everything below:
 
 ```
-# Name,        Type, SubType,  Offset,    Size,      Flags
-nvs_key,       data, nvs_keys, 0xf000,    0x1000,
-fctry,         data, nvs,      0x10000,   0x6000,
-nvs,           data, nvs,      0x16000,   0x6000,
-otadata,       data, ota,      0x1c000,   0x2000,
-phy_init,      data, phy,      0x1e000,   0x1000,
-model,         data, spiffs,   0x1f000,   0x96000,
-factory,       app,  factory,  0xc0000,   0x7d0000,
-board_test,    app,  ota_0,    0x890000,  0x190000,
-spiffs_data,   data, spiffs,   0xa20000,  0xc8000,
-anim_icon,     data, spiffs,   0xae8000,  0x271000,
-anim_boot,     data, spiffs,   0xd59000,  0xb9000,
-anim_emotion,  data, spiffs,   0xe12000,  0x1db000,
+# Name,          Type, SubType,   Offset,    Size,   Flags
+nvs_key,         data, nvs_keys,  0xf000,    0x1000,
+fctry,           data, nvs,       0x10000,   0x6000,
+nvs,             data, nvs,       0x16000,   0x6000,
+otadata,         data, ota,       0x1c000,   0x2000,
+phy_init,        data, phy,       0x1e000,   0x1000,
+model,           data, littlefs,  0x1f000,   600K,
+factory,         app,  factory,   0xc0000,   7M,
+storage,         data, fat,       0x7c0000,  500K,
+littlefs_data,   data, littlefs,  0x83d000,  500K,
+anim_icon,       data, littlefs,  0x8ba000,  3000K,
 ```
 
-Flash plan verification (baseline build):
+Stock kept alongside as `partitions_16m.csv.stock`. Rules: never
+`erase_flash`, and verify the flash plan's offsets against 0xf000–0x1c000
+before every write.
 
-| offset | partition | image | capacity | used |
-|---|---|---|---|---|
-| 0x0 | bootloader | 22,432 | 32,768 | 68% |
-| 0x8000 | partition table | 3,072 | 4,096 | 75% |
-| 0x1c000 | otadata | 8,192 | 8,192 | 100% |
-| 0x1f000 | model | 582,214 | 614,400 | 94% |
-| 0xc0000 | factory app | 7,933,600 | 8,192,000 | 96% |
-| 0xa20000 | spiffs_data | 819,200 | 819,200 | 100% |
-| 0xae8000 | anim_icon | 1,326,723 | 2,560,000 | 51% |
-| 0xd59000 | anim_boot | 648,188 | 757,760 | 85% |
-| 0xe12000 | anim_emotion | 1,933,483 | 1,945,600 | 99% |
+**Migrating firmware requires erasing `nvs`.** Preserving the old build's NVS
+made v0.7's Wi-Fi provisioning silently fail to persist — it reprovisioned on
+every boot. Fix, which does not touch `fctry`:
 
-`nvs_key`, `fctry` and `nvs` are never written. RainMaker credentials survive,
-and so does the provisioned Wi-Fi configuration.
+```bash
+esptool --chip esp32s3 -p <PORT> erase_region 0x16000 0x6000
+```
 
-**Headroom warning.** The app sits at 96% of its partition, 258 KB spare. Adding
-a WebSocket client and our own logic may overflow it. `board_test` sits directly
-between `factory` and `spiffs_data`, so `factory` can absorb it and grow from
-8000K to 9600K, ending exactly where `spiffs_data` starts. No other offsets move.
+## Target architecture
+
+```
+ESP-VoCat ──XiaoZhi protocol──> our server
+                                  ├─ STT
+                                  ├─ Hermes (persona) / Claude (work commands)
+                                  ├─ Bodhan TTS  (Sravani)
+                                  └─ emotion tag ──> eye animation
+```
+
+**v0.7 ships XiaoZhi as the default agent**, alongside Coze and OpenAI, with
+runtime switching. XiaoZhi is an open, self-hostable protocol, so the plan is no
+longer "write a WebSocket client and replace the Coze layer" — it is "stand up a
+XiaoZhi-compatible server and repoint the device." Substantially less firmware
+work than the v0.6 plan assumed.
+
+Default endpoint is `api.xiaozhi.me`; first boot shows an activation code to
+claim the device against a XiaoZhi account.
+
+## Voice: Bodhan indic-speak
+
+Hosted API, OpenAI-compatible shapes. `voice/bodhan.py`.
+
+- Base `https://api.bodhan.ai/v1`, `POST /audio/speech`, bearer auth
+- **4 requests/minute**, ₹6 per 10K characters, keys are per model
+- Response is `audio/wav`, PCM16, 24 kHz, mono
+
+The request shape is easy to get wrong. There is no `language_code` field;
+language and style go in `instructions` as a **JSON string**:
+
+```json
+{"model":"indic-speak","input":"...","voice":"Sravani",
+ "instructions":"{\"lang\": \"en\", \"style\": \"happy\"}"}
+```
+
+**Voice: `Sravani`** — the Telugu-recorded female. Any voice can read any
+language, so she gives Telugu-accented Indian English (the Hyderabad texture)
+and carries over unchanged when Telugu is added.
+
+Six of the fourteen styles are emotions, which the emotion tag maps onto:
+
+```
+annoyed→anger  worried→fear  excited/happy→happy  sad→sad  surprised→surprise
+neutral/thinking→(omit)
+```
+
+## Character
+
+Bujji (BU-JZ1): Bhairava's companion AI, formerly a cargo ship pilot AI. Voiced
+by Keerthy Suresh. Anxious, eager, fusses, tells you when you're being an idiot,
+unreservedly loyal. Not a servant.
+
+Eventually code-switches: Telugu **in Telugu script** for feeling, English for
+technical. Romanised Telugu will be read as English and produce garbage.
+
+## Eyes
+
+Angular red visor slits, generated rather than drawn, so they are editable as
+code. `eyes/make_eyes.py` renders 284x126 GIFs for eleven emotions. Resting
+face slants inward: focused, faintly unimpressed.
+
+Converted with the in-repo tool (`--depth 8` is real colour via a median-cut
+256-colour BGRA palette; `--depth 4` is grayscale):
+
+```bash
+python gif_to_aaf.py eyes/gif eyes/aaf --split 16 --depth 8 --enable-huffman
+```
+
+Geometric shapes compress far better than the stock organic art: 1,397,128
+bytes against 1,933,483 stock.
+
+**Needs rework for v0.7.** Built and flashed successfully on v0.6, which used
+SPIFFS and a dedicated `anim_emotion` partition. v0.7 uses LittleFS, has no
+`anim_emotion` (animations live in `anim_icon`), and drives expressions through
+a different `EmoteHelper` path. The generator and the designs carry over; the
+packaging does not.
 
 ## Recovery
 
-A full 16 MB dump of the factory image exists, including `fctry`. Full restore:
+Full 16 MB factory dump including `fctry`, sha256
+`8910dfbd...e8e5e39d`. Restores byte-perfect and has been exercised for real:
 
 ```bash
-esptool -p /dev/cu.usbmodem1101 write-flash 0x0 esp-vocat-factory-16MB.bin
+esptool -p <PORT> write_flash 0x0 backup/esp-vocat-factory-16MB.bin
 ```
-
-Keep this backup. It is the only copy of the factory credentials.
 
 ## SD card
 
-Required for the config workflow above, though the firmware boots without one
-after a 10 second warning screen. `SD_CARD_NOT_FOUND_RETRY_MAX_COUNT` can be set
-to 0 to remove that delay in our own builds.
-
-**32 GB maximum.** The constraint is the filesystem, not capacity: ESP-IDF
-hardcodes `FF_FS_EXFAT 0` with no Kconfig option, so only FAT16 and FAT32 mount.
-SDXC cards (64 GB+) ship as exFAT and will not mount as sold.
+Optional. Without one the firmware shows a warning and stalls 10 seconds before
+continuing. 32 GB maximum and FAT32 only — ESP-IDF hardcodes `FF_FS_EXFAT 0`, so
+SDXC cards ship unmountable.
 
 ## Status
 
-Done:
+Working:
 
-- Factory flash dumped and verified
-- ESP-IDF v5.5 toolchain working
-- esp-brookesia `release/v0.6` cloned
-- Custom partition table written and validated
-- Baseline build compiles clean (2207/2207)
+- v0.7 chatbot, stock, boots clean — 0 reboots, 0 asserts over 45s
+- Wi-Fi provisioning via SoftAP portal at `192.168.4.1`, persists after the
+  `nvs` erase
+- XiaoZhi agent activated and holding a conversation
+- Bodhan TTS client, Bujji voice samples across six emotions
+- Eye generator and conversion pipeline
 
 Next:
 
-1. Flash the baseline and confirm display, touch and Wi-Fi on our own build
-2. Stand up the server with a trivial echo agent
-3. Replace the Coze client with a WebSocket client to it
-4. Fill in STT, TTS, the Claude bridge and emotion tags, one at a time
+1. Repackage the eyes for v0.7 (LittleFS, `anim_icon`, `EmoteHelper`)
+2. Stand up a self-hosted XiaoZhi server and repoint the device
+3. Wire Hermes for persona, Bodhan for voice, emotion tags to the eyes
+4. Add the Claude Agent SDK path for work commands
 
-Open decisions:
+## Debugging notes
 
-- Server on the Mac (simple, LAN only, dies when the Mac sleeps) or reachable
-  from anywhere? Affects transport and auth.
-- Local or hosted STT and TTS.
+Worth remembering, because each cost real time:
+
+- `heap_caps_free ... outside heap areas` recurring across **unrelated** threads
+  means the environment is wrong, not the code. Chasing individual call sites
+  produced three wrong fixes in a row.
+- Read the app descriptor at app-partition + 0x20 to fingerprint a factory
+  firmware. Version, project name, build date and IDF version. Doing this first
+  would have saved the entire v0.6 detour.
+- `idf.py` exiting 0 having done nothing means `cmake` is missing.
+- Opening the serial port toggles DTR/RTS and can reset an ESP32-S3 over native
+  USB, so monitoring perturbs what it measures.
